@@ -122,7 +122,7 @@ func listRegisteredAgents() []string {
 	// We'll test via the factory pattern
 	agents := []string{
 		"claudecode", "codex", "cursor", "gemini",
-		"iflow", "opencode", "pi", "qoder",
+		"hermes", "iflow", "opencode", "pi", "qoder",
 	}
 	return agents
 }
