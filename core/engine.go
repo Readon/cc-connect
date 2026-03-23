@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -187,6 +188,9 @@ type Engine struct {
 	autoCompressMaxTokens int
 	autoCompressMinGap    time.Duration
 
+	// When true, append [ctx: ~N%] (or model self-report) to assistant replies shown on platforms.
+	showContextIndicator bool
+
 	// Multi-workspace mode
 	multiWorkspace    bool
 	baseDir           string
@@ -295,6 +299,7 @@ func NewEngine(name string, ag Agent, platforms []Platform, sessionStorePath str
 		startedAt:             time.Now(),
 		streamPreview:         DefaultStreamPreviewCfg(),
 		eventIdleTimeout:      defaultEventIdleTimeout,
+		showContextIndicator:  true,
 	}
 
 	if ag != nil {
@@ -405,6 +410,11 @@ func (e *Engine) SetAutoCompressConfig(enabled bool, maxTokens int, minGap time.
 		minGap = 30 * time.Minute
 	}
 	e.autoCompressMinGap = minGap
+}
+
+// SetShowContextIndicator controls whether assistant replies include the [ctx: ~N%] suffix.
+func (e *Engine) SetShowContextIndicator(show bool) {
+	e.showContextIndicator = show
 }
 
 // SetInjectSender controls whether sender identity (platform and user ID) is
@@ -736,9 +746,31 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 		return fmt.Errorf("platform %q does not support proactive messaging (cron)", platformName)
 	}
 
-	replyCtx, err := rc.ReconstructReplyCtx(sessionKey)
-	if err != nil {
-		return fmt.Errorf("reconstruct reply context: %w", err)
+	runSessionKey := sessionKey
+	var replyCtx any
+	var err error
+	if !job.Mute {
+		if resolver, ok := targetPlatform.(CronReplyTargetResolver); ok {
+			resolvedSessionKey, resolvedReplyCtx, err := resolver.ResolveCronReplyTarget(sessionKey, cronRunTitle(job))
+			if err != nil {
+				if !errors.Is(err, ErrNotSupported) {
+					return fmt.Errorf("resolve cron reply target: %w", err)
+				}
+			} else {
+				if resolvedSessionKey != "" {
+					runSessionKey = resolvedSessionKey
+				}
+				if resolvedReplyCtx != nil {
+					replyCtx = resolvedReplyCtx
+				}
+			}
+		}
+	}
+	if replyCtx == nil {
+		replyCtx, err = rc.ReconstructReplyCtx(runSessionKey)
+		if err != nil {
+			return fmt.Errorf("reconstruct reply context: %w", err)
+		}
 	}
 
 	// Wrap platform to discard all outgoing messages when muted
@@ -780,12 +812,13 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 	}
 
 	if job.UsesNewSessionPerRun() {
-		session := e.sessions.NewSideSession(sessionKey, "cron-"+job.ID)
+		msg.SessionKey = runSessionKey
+		session := e.sessions.NewSideSession(runSessionKey, "cron-"+job.ID)
 		if !session.TryLock() {
-			return fmt.Errorf("session %q is busy", sessionKey)
+			return fmt.Errorf("session %q is busy", runSessionKey)
 		}
-		iKey := fmt.Sprintf("%s#cron:%s", sessionKey, session.ID)
-		e.processInteractiveMessageWith(effectivePlatform, msg, session, e.agent, e.sessions, iKey, "", sessionKey)
+		iKey := fmt.Sprintf("%s#cron:%s", runSessionKey, session.ID)
+		e.processInteractiveMessageWith(effectivePlatform, msg, session, e.agent, e.sessions, iKey, "", runSessionKey)
 		return nil
 	}
 
@@ -794,8 +827,27 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 		return fmt.Errorf("session %q is busy", sessionKey)
 	}
 
-	e.processInteractiveMessage(effectivePlatform, msg, session)
+	e.processInteractiveMessageWith(effectivePlatform, msg, session, e.agent, e.sessions, sessionKey, "", sessionKey)
 	return nil
+}
+
+func cronRunTitle(job *CronJob) string {
+	if job == nil {
+		return "cron"
+	}
+	if desc := strings.TrimSpace(job.Description); desc != "" {
+		return truncateStr(desc, 60)
+	}
+	if job.IsShellJob() {
+		if cmd := strings.TrimSpace(job.Exec); cmd != "" {
+			return truncateStr(cmd, 60)
+		}
+		return "cron"
+	}
+	if prompt := strings.TrimSpace(job.Prompt); prompt != "" {
+		return truncateStr(prompt, 60)
+	}
+	return "cron"
 }
 
 // executeCronShell runs a shell command for a cron job and sends the output.
@@ -1627,8 +1679,16 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	if agent != e.agent {
 		agentOverride = agent
 	}
+	// Per-workspace connectedOnce flag so that idle-reaped workspaces
+	// re-use --continue on their first reconnection.
+	var wsConnectedOnce *atomic.Bool
+	if workspaceDir != "" {
+		if ws := e.workspacePool.Get(workspaceDir); ws != nil {
+			wsConnectedOnce = &ws.hasConnectedOnce
+		}
+	}
 	consumeBridge := messageConsumesFirstContinueBridge(msg)
-	state := e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agentOverride, ccSessionKey, consumeBridge)
+	state := e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agentOverride, ccSessionKey, consumeBridge, wsConnectedOnce)
 
 	// Set workspaceDir on the state for idle reaper identification
 	if workspaceDir != "" {
@@ -1689,7 +1749,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 			e.cleanupInteractiveState(interactiveKey, state)
 			e.send(p, msg.ReplyCtx, e.i18n.T(MsgSessionRestarting))
 
-			state = e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agentOverride, ccSessionKey, consumeBridge)
+			state = e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agentOverride, ccSessionKey, consumeBridge, wsConnectedOnce)
 			if workspaceDir != "" {
 				state.mu.Lock()
 				state.workspaceDir = workspaceDir
@@ -1802,13 +1862,14 @@ func messageConsumesFirstContinueBridge(msg *Message) bool {
 	}
 }
 
-// getOrCreateInteractiveStateWith accepts
-// an optional agent override for multi-workspace mode. When agentOverride is non-nil
-// it is used instead of e.agent to start the session.
+// getOrCreateInteractiveStateWith accepts an optional agent override for multi-workspace mode.
+// When agentOverride is non-nil it is used instead of e.agent to start the session.
 // ccSessionKey, when non-empty, is used for CC_SESSION_KEY env injection; otherwise sessionKey is used.
 // consumeFirstUserContinueBridge controls whether this start may use the global
 // one-time ContinueSession bridge (see messageConsumesFirstContinueBridge).
-func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, replyCtx any, session *Session, sessions *SessionManager, agentOverride Agent, ccSessionKey string, consumeFirstUserContinueBridge bool) *interactiveState {
+// connectedOnce, when non-nil, is used instead of the engine-level hasConnectedOnce flag
+// (for per-workspace tracking after idle reap).
+func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, replyCtx any, session *Session, sessions *SessionManager, agentOverride Agent, ccSessionKey string, consumeFirstUserContinueBridge bool, connectedOnce *atomic.Bool) *interactiveState {
 	e.interactiveMu.Lock()
 	defer e.interactiveMu.Unlock()
 
@@ -1890,11 +1951,15 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 		return state
 	}
 
-	// On first real-user connection after engine startup, use --continue to pick up
-	// the most recent CLI session (bridges direct CLI and cc-connect usage).
+	// On first real-user connection after engine startup (or workspace re-creation
+	// after idle reap), use --continue to pick up the most recent CLI session.
 	// Subsequent connections respect the stored session ID (or "" for fresh).
 	startSessionID := session.GetAgentSessionID()
-	if consumeFirstUserContinueBridge && !e.hasConnectedOnce.Swap(true) {
+	once := &e.hasConnectedOnce
+	if connectedOnce != nil {
+		once = connectedOnce
+	}
+	if consumeFirstUserContinueBridge && !once.Swap(true) {
 		startSessionID = ContinueSession
 	}
 
@@ -1903,10 +1968,25 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	agentSession, err := agent.StartSession(e.ctx, startSessionID)
 	startElapsed := time.Since(startAt)
 	if err != nil {
-		slog.Error("failed to start interactive session", "error", err, "elapsed", startElapsed)
-		state = &interactiveState{platform: p, replyCtx: replyCtx, quiet: quietMode}
-		e.interactiveStates[sessionKey] = state
-		return state
+		// If resume/continue failed, try a fresh session as fallback.
+		if startSessionID != "" {
+			slog.Error("session resume failed, falling back to fresh session",
+				"session_key", sessionKey, "failed_session_id", startSessionID,
+				"error", err, "elapsed", startElapsed)
+			startAt = time.Now()
+			agentSession, err = agent.StartSession(e.ctx, "")
+			startElapsed = time.Since(startAt)
+			if err == nil {
+				slog.Info("fresh session started after resume failure",
+					"session_key", sessionKey, "elapsed", startElapsed)
+			}
+		}
+		if err != nil {
+			slog.Error("failed to start interactive session", "error", err, "elapsed", startElapsed)
+			state = &interactiveState{platform: p, replyCtx: replyCtx, quiet: quietMode}
+			e.interactiveStates[sessionKey] = state
+			return state
+		}
 	}
 	if startElapsed >= slowAgentStart {
 		slog.Warn("slow agent session start", "elapsed", startElapsed, "agent", agent.Name(), "session_id", startSessionID)
@@ -2021,7 +2101,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		case <-idleCh:
 			slog.Error("agent session idle timeout: no events for too long, killing session",
 				"session_key", sessionKey, "timeout", e.eventIdleTimeout, "elapsed", time.Since(turnStart))
-			sp.finish("")
+			sp.discard()
 			state.mu.Lock()
 			p := state.platform
 			replyCtx := state.replyCtx
@@ -2239,10 +2319,16 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				fullResponse = e.i18n.T(MsgEmptyResponse)
 			}
 
+			// Context usage indicator: prefer SDK tokens, fall back to self-reported.
+			sdkPlausible := event.InputTokens >= 100
+			selfPct := parseSelfReportedCtx(fullResponse)
+			cleanResponse := ctxSelfReportRe.ReplaceAllString(fullResponse, "")
+			cleanResponse = strings.TrimRight(cleanResponse, "\n ")
+
 			// Evaluate auto-compress trigger (token estimate on user+assistant text,
 			// including this turn's assistant reply before it is appended to history).
 			if e.autoCompressEnabled && e.autoCompressMaxTokens > 0 {
-				estimate := estimateTokensWithPendingAssistant(session.GetHistory(0), fullResponse)
+				estimate := estimateTokensWithPendingAssistant(session.GetHistory(0), cleanResponse)
 				now := time.Now()
 				state.mu.Lock()
 				last := state.lastAutoCompressAt
@@ -2255,8 +2341,17 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 			}
 
-			session.AddHistory("assistant", fullResponse)
+			session.AddHistory("assistant", cleanResponse)
 			sessions.Save()
+
+			if e.showContextIndicator {
+				if sdkPlausible {
+					cleanResponse += contextIndicator(event.InputTokens)
+				} else if selfPct > 0 {
+					cleanResponse += fmt.Sprintf("\n[ctx: ~%d%%]", selfPct)
+				}
+			}
+			fullResponse = cleanResponse
 
 			turnDuration := time.Since(turnStart)
 			slog.Info("turn complete",
@@ -2266,6 +2361,8 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				"tools", toolCount,
 				"response_len", len(fullResponse),
 				"turn_duration", turnDuration,
+				"input_tokens", event.InputTokens,
+				"output_tokens", event.OutputTokens,
 			)
 
 			replyStart := time.Now()
@@ -2275,9 +2372,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			state.sideText = ""
 			state.mu.Unlock()
 
-			// When tool calls happened, text was sent in segments; only send remainder.
-			if toolCount > 0 {
-				sp.finish("") // cleanup preview
+			// When tool calls happened and prior text was already surfaced in segments,
+			// only send the unsent remainder. In quiet mode, tool events don't surface
+			// side-channel messages and segmentStart stays 0, so keep normal finalize flow.
+			if toolCount > 0 && segmentStart > 0 {
+				sp.discard()
 				if segmentStart < len(textParts) {
 					unsent := strings.Join(textParts[segmentStart:], "")
 					if unsent != "" {
@@ -2290,7 +2389,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					}
 				}
 			} else if suppressDuplicate {
-				sp.finish("")
+				sp.discard()
 				slog.Debug("EventResult: suppressed duplicate side-channel text", "response_len", len(fullResponse))
 			} else if sp.finish(fullResponse) {
 				slog.Debug("EventResult: finalized via stream preview", "response_len", len(fullResponse))
@@ -2424,7 +2523,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			return
 
 		case EventError:
-			sp.finish("") // clean up preview on error
+			sp.discard()
 			if event.Error != nil {
 				slog.Error("agent error", "error", event.Error)
 				e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), event.Error))
@@ -2454,8 +2553,8 @@ channelClosed:
 		fullResponse := strings.Join(textParts, "")
 		session.AddHistory("assistant", fullResponse)
 
-		if toolCount > 0 {
-			sp.finish("")
+		if toolCount > 0 && segmentStart > 0 {
+			sp.discard()
 			if segmentStart < len(textParts) {
 				unsent := strings.Join(textParts[segmentStart:], "")
 				if unsent != "" {
@@ -2942,6 +3041,9 @@ func (e *Engine) cmdNew(p Platform, msg *Message, args []string) {
 
 const listPageSize = 20
 
+// dirCardPageSize is the max directory history rows per card page (Feishu / other card UIs).
+const dirCardPageSize = 20
+
 func (e *Engine) cmdList(p Platform, msg *Message, args []string) {
 	agent, sessions, _, err := e.commandContext(p, msg)
 	if err != nil {
@@ -3192,6 +3294,108 @@ func (e *Engine) cmdShell(p Platform, msg *Message, raw string) {
 	}()
 }
 
+// dirApply applies /dir mutations (same semantics as cmdDir). sessionKey is used for GetOrCreateActive.
+// On failure returns a non-empty errMsg; on success returns ("", successMsg) for plain-text replies.
+func (e *Engine) dirApply(agent Agent, sessions *SessionManager, interactiveKey, sessionKey string, args []string) (errMsg, successMsg string) {
+	switcher, ok := agent.(WorkDirSwitcher)
+	if !ok {
+		return e.i18n.T(MsgDirNotSupported), ""
+	}
+	currentDir := switcher.GetWorkDir()
+
+	if len(args) == 1 {
+		switch strings.ToLower(strings.TrimSpace(args[0])) {
+		case "reset":
+			baseDir := strings.TrimSpace(e.baseWorkDir)
+			if baseDir == "" {
+				baseDir = currentDir
+			}
+			if baseDir == "" {
+				baseDir, _ = os.Getwd()
+			}
+			if absDir, err := filepath.Abs(baseDir); err == nil {
+				baseDir = absDir
+			}
+
+			switcher.SetWorkDir(baseDir)
+			e.cleanupInteractiveState(interactiveKey)
+
+			s := sessions.GetOrCreateActive(sessionKey)
+			s.SetAgentSessionID("", "")
+			s.ClearHistory()
+			sessions.Save()
+
+			if e.projectState != nil {
+				e.projectState.ClearWorkDirOverride()
+				e.projectState.Save()
+			}
+			if e.dirHistory != nil {
+				e.dirHistory.Add(e.name, baseDir)
+			}
+
+			return "", e.i18n.Tf(MsgDirReset, baseDir)
+		}
+	}
+
+	arg := strings.Join(args, " ")
+	var newDir string
+
+	if idx, err := strconv.Atoi(strings.TrimSpace(arg)); err == nil && idx > 0 {
+		if e.dirHistory != nil {
+			newDir = e.dirHistory.Get(e.name, idx)
+			if newDir == "" {
+				return e.i18n.Tf(MsgDirInvalidIndex, idx), ""
+			}
+		} else {
+			return e.i18n.T(MsgDirNoHistory), ""
+		}
+	} else if arg == "-" {
+		if e.dirHistory != nil {
+			newDir = e.dirHistory.Previous(e.name)
+			if newDir == "" {
+				return e.i18n.T(MsgDirNoPrevious), ""
+			}
+		} else {
+			return e.i18n.T(MsgDirNoHistory), ""
+		}
+	} else {
+		newDir = filepath.Clean(arg)
+		if !filepath.IsAbs(newDir) {
+			baseDir := currentDir
+			if baseDir == "" {
+				baseDir, _ = os.Getwd()
+			}
+			newDir = filepath.Join(baseDir, newDir)
+		}
+	}
+	if absDir, err := filepath.Abs(newDir); err == nil {
+		newDir = absDir
+	}
+
+	info, err := os.Stat(newDir)
+	if err != nil || !info.IsDir() {
+		return e.i18n.Tf(MsgDirInvalidPath, newDir), ""
+	}
+
+	switcher.SetWorkDir(newDir)
+	e.cleanupInteractiveState(interactiveKey)
+
+	s := sessions.GetOrCreateActive(sessionKey)
+	s.SetAgentSessionID("", "")
+	s.ClearHistory()
+	sessions.Save()
+
+	if e.dirHistory != nil {
+		e.dirHistory.Add(e.name, newDir)
+	}
+	if e.projectState != nil {
+		e.projectState.SetWorkDirOverride(newDir)
+		e.projectState.Save()
+	}
+
+	return "", e.i18n.Tf(MsgDirChanged, newDir)
+}
+
 func (e *Engine) cmdDir(p Platform, msg *Message, args []string) {
 	agent, sessions, interactiveKey, err := e.commandContext(p, msg)
 	if err != nil {
@@ -3206,8 +3410,11 @@ func (e *Engine) cmdDir(p Platform, msg *Message, args []string) {
 
 	currentDir := switcher.GetWorkDir()
 
-	// No args: show current dir + history
 	if len(args) == 0 {
+		if supportsCards(p) {
+			e.replyWithCard(p, msg.ReplyCtx, e.renderDirCardSafe(msg.SessionKey, 1))
+			return
+		}
 		var sb strings.Builder
 		sb.WriteString(e.i18n.Tf(MsgDirCurrent, currentDir))
 
@@ -3236,105 +3443,19 @@ func (e *Engine) cmdDir(p Platform, msg *Message, args []string) {
 		case "help", "-h", "--help":
 			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgDirUsage))
 			return
-		case "reset":
-			baseDir := strings.TrimSpace(e.baseWorkDir)
-			if baseDir == "" {
-				baseDir = currentDir
-			}
-			if baseDir == "" {
-				baseDir, _ = os.Getwd()
-			}
-			if absDir, err := filepath.Abs(baseDir); err == nil {
-				baseDir = absDir
-			}
-
-			switcher.SetWorkDir(baseDir)
-			e.cleanupInteractiveState(interactiveKey)
-
-			s := sessions.GetOrCreateActive(msg.SessionKey)
-			s.SetAgentSessionID("", "")
-			s.ClearHistory()
-			sessions.Save()
-
-			if e.projectState != nil {
-				e.projectState.ClearWorkDirOverride()
-				e.projectState.Save()
-			}
-			if e.dirHistory != nil {
-				e.dirHistory.Add(e.name, baseDir)
-			}
-
-			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgDirReset, baseDir))
-			return
 		}
 	}
 
-	arg := strings.Join(args, " ")
-	var newDir string
-
-	// Check if argument is a number (history index)
-	if idx, err := strconv.Atoi(strings.TrimSpace(arg)); err == nil && idx > 0 {
-		if e.dirHistory != nil {
-			newDir = e.dirHistory.Get(e.name, idx)
-			if newDir == "" {
-				e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgDirInvalidIndex, idx))
-				return
-			}
-		} else {
-			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgDirNoHistory))
-			return
-		}
-	} else if arg == "-" {
-		// Jump to previous directory
-		if e.dirHistory != nil {
-			newDir = e.dirHistory.Previous(e.name)
-			if newDir == "" {
-				e.reply(p, msg.ReplyCtx, e.i18n.T(MsgDirNoPrevious))
-				return
-			}
-		} else {
-			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgDirNoHistory))
-			return
-		}
-	} else {
-		// Normal path
-		newDir = filepath.Clean(arg)
-		if !filepath.IsAbs(newDir) {
-			baseDir := currentDir
-			if baseDir == "" {
-				baseDir, _ = os.Getwd()
-			}
-			newDir = filepath.Join(baseDir, newDir)
-		}
-	}
-	if absDir, err := filepath.Abs(newDir); err == nil {
-		newDir = absDir
-	}
-
-	info, err := os.Stat(newDir)
-	if err != nil || !info.IsDir() {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgDirInvalidPath, newDir))
+	errMsg, successMsg := e.dirApply(agent, sessions, interactiveKey, msg.SessionKey, args)
+	if errMsg != "" {
+		e.reply(p, msg.ReplyCtx, errMsg)
 		return
 	}
-
-	switcher.SetWorkDir(newDir)
-	e.cleanupInteractiveState(interactiveKey)
-
-	s := sessions.GetOrCreateActive(msg.SessionKey)
-	s.SetAgentSessionID("", "")
-	s.ClearHistory()
-	sessions.Save()
-
-	// Add to history
-	if e.dirHistory != nil {
-		e.dirHistory.Add(e.name, newDir)
+	if supportsCards(p) {
+		e.replyWithCard(p, msg.ReplyCtx, e.renderDirCardSafe(msg.SessionKey, 1))
+		return
 	}
-	if e.projectState != nil {
-		e.projectState.SetWorkDirOverride(newDir)
-		e.projectState.Save()
-	}
-
-	e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgDirChanged, newDir))
+	e.reply(p, msg.ReplyCtx, successMsg)
 }
 
 // cmdSearch searches sessions by name or message content.
@@ -3562,8 +3683,7 @@ func (e *Engine) cmdStatus(p Platform, msg *Message) {
 
 		var cronStr string
 		if e.cronScheduler != nil {
-			jobs := e.cronScheduler.Store().ListBySessionKey(msg.SessionKey)
-			if len(jobs) > 0 {
+			if jobs := e.cronScheduler.Store().ListBySessionKey(msg.SessionKey); len(jobs) > 0 {
 				enabledCount := 0
 				for _, j := range jobs {
 					if j.Enabled {
@@ -3905,6 +4025,15 @@ func (e *Engine) renderListCardSafe(sessionKey string, page int) *Card {
 	return card
 }
 
+// renderDirCardSafe wraps renderDirCard and returns an error card on failure.
+func (e *Engine) renderDirCardSafe(sessionKey string, page int) *Card {
+	card, err := e.renderDirCard(sessionKey, page)
+	if err != nil {
+		return e.simpleCard(e.i18n.T(MsgDirCardTitle), "red", err.Error())
+	}
+	return card
+}
+
 func (e *Engine) renderStatusCard(sessionKey string, userID string) *Card {
 	agent, sessions := e.sessionContextForKey(sessionKey)
 	platNames := make([]string, len(e.platforms))
@@ -3959,8 +4088,7 @@ func (e *Engine) renderStatusCard(sessionKey string, userID string) *Card {
 
 	var cronStr string
 	if e.cronScheduler != nil {
-		jobs := e.cronScheduler.Store().ListBySessionKey(sessionKey)
-		if len(jobs) > 0 {
+		if jobs := e.cronScheduler.Store().ListBySessionKey(sessionKey); len(jobs) > 0 {
 			enabledCount := 0
 			for _, j := range jobs {
 				if j.Enabled {
@@ -4255,6 +4383,7 @@ func helpCardGroups() []helpCardGroup {
 				{command: "/config", action: "nav:/config"},
 				{command: "/bind", action: "cmd:/bind"},
 				{command: "/workspace", action: "cmd:/workspace"},
+				{command: "/dir", action: "nav:/dir"},
 				{command: "/version", action: "nav:/version"},
 				{command: "/upgrade", action: "nav:/upgrade"},
 				{command: "/restart", action: "cmd:/restart"},
@@ -5636,6 +5765,14 @@ func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
 			}
 		}
 		return e.renderListCardSafe(sessionKey, page)
+	case "/dir":
+		page := 1
+		if args != "" {
+			if n, err := strconv.Atoi(args); err == nil && n > 0 {
+				page = n
+			}
+		}
+		return e.renderDirCardSafe(sessionKey, page)
 	case "/current":
 		return e.renderCurrentCard(sessionKey)
 	case "/history":
@@ -5643,7 +5780,7 @@ func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
 	case "/provider":
 		return e.renderProviderCard()
 	case "/cron":
-		return e.renderCronCard(sessionKey)
+		return e.renderCronCard(sessionKey, extractUserID(sessionKey))
 	case "/heartbeat":
 		return e.renderHeartbeatCard()
 	case "/commands":
@@ -5841,6 +5978,32 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 		session.SetAgentInfo(matched.ID, agent.Name(), matched.Summary)
 		session.ClearHistory()
 		sessions.Save()
+
+	case "/dir":
+		fields := strings.Fields(args)
+		if len(fields) == 0 {
+			return
+		}
+		agent, sessions := e.sessionContextForKey(sessionKey)
+		ik := e.interactiveKeyForSessionKey(sessionKey)
+		var applyArgs []string
+		switch fields[0] {
+		case "select":
+			if len(fields) < 2 {
+				return
+			}
+			applyArgs = []string{fields[1]}
+		case "reset":
+			applyArgs = []string{"reset"}
+		case "prev":
+			applyArgs = []string{"-"}
+		default:
+			return
+		}
+		errMsg, _ := e.dirApply(agent, sessions, ik, sessionKey, applyArgs)
+		if errMsg != "" {
+			slog.Debug("dir card action failed", "message", errMsg)
+		}
 
 	case "/stop":
 		sessionKey = e.interactiveKeyForSessionKey(sessionKey)
@@ -6445,6 +6608,93 @@ func (e *Engine) renderListCard(sessionKey string, page int) (*Card, error) {
 	return cb.Build(), nil
 }
 
+// dirCardTruncPath shortens absolute paths for card list rows.
+func dirCardTruncPath(absPath string) string {
+	r := []rune(absPath)
+	if len(r) <= 56 {
+		return absPath
+	}
+	return string(r[:53]) + "…"
+}
+
+func (e *Engine) renderDirCard(sessionKey string, page int) (*Card, error) {
+	agent, _ := e.sessionContextForKey(sessionKey)
+	switcher, ok := agent.(WorkDirSwitcher)
+	if !ok {
+		return nil, fmt.Errorf("%s", e.i18n.T(MsgDirNotSupported))
+	}
+	currentDir := switcher.GetWorkDir()
+	var history []string
+	if e.dirHistory != nil {
+		history = e.dirHistory.List(e.name)
+	}
+	total := len(history)
+	totalPages := 1
+	if total > 0 {
+		totalPages = (total + dirCardPageSize - 1) / dirCardPageSize
+	}
+	if page < 1 {
+		page = 1
+	}
+	if page > totalPages {
+		page = totalPages
+	}
+	start := (page - 1) * dirCardPageSize
+	end := start + dirCardPageSize
+	if end > total {
+		end = total
+	}
+
+	cb := NewCard().Title(e.i18n.T(MsgDirCardTitle), "turquoise")
+	cb.Markdown(e.i18n.Tf(MsgDirCurrent, currentDir))
+	if total == 0 {
+		cb.Note(e.i18n.T(MsgDirCardEmptyHistory))
+	} else {
+		cb.Divider()
+		for i := start; i < end; i++ {
+			dir := history[i]
+			marker := "◻"
+			if dir == currentDir {
+				marker = "▶"
+			}
+			btnType := "default"
+			if dir == currentDir {
+				btnType = "primary"
+			}
+			displayPath := dirCardTruncPath(dir)
+			cb.ListItemBtn(
+				fmt.Sprintf("%s **%d.** `%s`", marker, i+1, displayPath),
+				fmt.Sprintf("#%d", i+1),
+				btnType,
+				fmt.Sprintf("act:/dir select %d", i+1),
+			)
+		}
+	}
+
+	var actionRow []CardButton
+	if e.dirHistory != nil && len(history) >= 2 {
+		actionRow = append(actionRow, DefaultBtn(e.i18n.T(MsgDirCardPrev), "act:/dir prev"))
+	}
+	actionRow = append(actionRow, DefaultBtn(e.i18n.T(MsgDirCardReset), "act:/dir reset"))
+	cb.Buttons(actionRow...)
+
+	var navBtns []CardButton
+	if totalPages > 1 && page > 1 {
+		navBtns = append(navBtns, e.cardPrevButton(fmt.Sprintf("nav:/dir %d", page-1)))
+	}
+	navBtns = append(navBtns, e.cardBackButton())
+	if totalPages > 1 && page < totalPages {
+		navBtns = append(navBtns, e.cardNextButton(fmt.Sprintf("nav:/dir %d", page+1)))
+	}
+	cb.Buttons(navBtns...)
+
+	if totalPages > 1 {
+		cb.Note(fmt.Sprintf(e.i18n.T(MsgDirCardPageHint), page, totalPages))
+	}
+
+	return cb.Build(), nil
+}
+
 // ──────────────────────────────────────────────────────────────
 // Navigable sub-cards (for in-place card updates)
 // ──────────────────────────────────────────────────────────────
@@ -6541,7 +6791,7 @@ func (e *Engine) renderProviderCard() *Card {
 	return cb.Buttons(e.cardBackButton()).Build()
 }
 
-func (e *Engine) renderCronCard(sessionKey string) *Card {
+func (e *Engine) renderCronCard(sessionKey string, userID string) *Card {
 	if e.cronScheduler == nil {
 		return e.simpleCard(e.i18n.T(MsgCardTitleCron), "orange", e.i18n.T(MsgCronNotAvailable))
 	}
@@ -6896,7 +7146,7 @@ func (e *Engine) cmdCron(p Platform, msg *Message, args []string) {
 			e.cmdCronList(p, msg)
 			return
 		}
-		e.replyWithCard(p, msg.ReplyCtx, e.renderCronCard(msg.SessionKey))
+		e.replyWithCard(p, msg.ReplyCtx, e.renderCronCard(msg.SessionKey, msg.UserID))
 		return
 	}
 
@@ -8889,4 +9139,38 @@ func gitClone(repoURL, dest string) error {
 		return fmt.Errorf("%s: %w", strings.TrimSpace(string(output)), err)
 	}
 	return nil
+}
+
+// ── Context usage indicator ──────────────────────────────────
+
+const modelContextWindow = 200_000 // Claude's context window size in tokens
+
+// contextIndicator returns a suffix like "\n[ctx: ~42%]" based on SDK-reported input tokens.
+func contextIndicator(inputTokens int) string {
+	if inputTokens <= 0 {
+		return ""
+	}
+	pct := inputTokens * 100 / modelContextWindow
+	if pct > 100 {
+		pct = 100
+	}
+	return fmt.Sprintf("\n[ctx: ~%d%%]", pct)
+}
+
+// ctxSelfReportRe matches agent self-reported context lines like "[ctx: ~42%]".
+var ctxSelfReportRe = regexp.MustCompile(`(?m)\n?\[ctx: ~\d+%\]`)
+
+// parseSelfReportedCtx extracts the percentage from a self-reported "[ctx: ~XX%]" line.
+func parseSelfReportedCtx(s string) int {
+	m := ctxSelfReportRe.FindString(s)
+	if m == "" {
+		return 0
+	}
+	start := strings.Index(m, "~") + 1
+	end := strings.Index(m, "%")
+	if start <= 0 || end <= start {
+		return 0
+	}
+	v, _ := strconv.Atoi(m[start:end])
+	return v
 }

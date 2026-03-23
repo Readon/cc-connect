@@ -39,14 +39,16 @@ type claudeSession struct {
 	alive       atomic.Bool
 }
 
-func newClaudeSession(ctx context.Context, workDir, model, sessionID, mode string, allowedTools, disallowedTools []string, extraEnv []string, platformPrompt string) (*claudeSession, error) {
+func newClaudeSession(ctx context.Context, workDir, model, sessionID, mode string, allowedTools, disallowedTools []string, extraEnv []string, platformPrompt string, disableVerbose bool) (*claudeSession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
 
 	args := []string{
 		"--output-format", "stream-json",
-		"--verbose",
 		"--input-format", "stream-json",
 		"--permission-prompt-tool", "stdio",
+	}
+	if !disableVerbose {
+		args = append(args, "--verbose")
 	}
 
 	if mode != "" && mode != "default" {
@@ -292,7 +294,25 @@ func (cs *claudeSession) handleResult(raw map[string]any) {
 	if sid, ok := raw["session_id"].(string); ok && sid != "" {
 		cs.sessionID.Store(sid)
 	}
-	evt := core.Event{Type: core.EventResult, Content: content, SessionID: cs.CurrentSessionID(), Done: true}
+
+	var inputTokens, outputTokens int
+	if usage, ok := raw["usage"].(map[string]any); ok {
+		if v, ok := usage["input_tokens"].(float64); ok {
+			inputTokens = int(v)
+		}
+		if v, ok := usage["output_tokens"].(float64); ok {
+			outputTokens = int(v)
+		}
+	}
+
+	evt := core.Event{
+		Type:         core.EventResult,
+		Content:      content,
+		SessionID:    cs.CurrentSessionID(),
+		Done:         true,
+		InputTokens:  inputTokens,
+		OutputTokens: outputTokens,
+	}
 	select {
 	case cs.events <- evt:
 	case <-cs.ctx.Done():
