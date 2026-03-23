@@ -116,3 +116,48 @@ func TestNew_MissingBinary(t *testing.T) {
 
 // verify Agent implements core.Agent
 var _ core.Agent = (*Agent)(nil)
+
+// ── parseHermesOutput tests ──────────────────────────────────────────────────
+
+func TestParseHermesOutput_WithSessionID(t *testing.T) {
+	output := "Hello, world!\n\nsession_id: 20260225_143052_a1b2c3\n"
+	response, sessionID := parseHermesOutput(output)
+	if response != "Hello, world!" {
+		t.Errorf("response = %q, want %q", response, "Hello, world!")
+	}
+	if sessionID != "20260225_143052_a1b2c3" {
+		t.Errorf("sessionID = %q, want %q", sessionID, "20260225_143052_a1b2c3")
+	}
+}
+
+func TestParseHermesOutput_MultiLineResponse(t *testing.T) {
+	output := "Line one\nLine two\nLine three\n\nsession_id: abc123\n"
+	response, sessionID := parseHermesOutput(output)
+	if response != "Line one\nLine two\nLine three" {
+		t.Errorf("response = %q, want %q", response, "Line one\nLine two\nLine three")
+	}
+	if sessionID != "abc123" {
+		t.Errorf("sessionID = %q, want %q", sessionID, "abc123")
+	}
+}
+
+func TestParseHermesOutput_NoSessionID(t *testing.T) {
+	output := "Just a response with no session id.\n"
+	response, sessionID := parseHermesOutput(output)
+	if response != "Just a response with no session id." {
+		t.Errorf("response = %q, want %q", response, "Just a response with no session id.")
+	}
+	if sessionID != "" {
+		t.Errorf("sessionID = %q, want empty", sessionID)
+	}
+}
+
+func TestParseHermesOutput_EmptyOutput(t *testing.T) {
+	response, sessionID := parseHermesOutput("")
+	if response != "" {
+		t.Errorf("response = %q, want empty", response)
+	}
+	if sessionID != "" {
+		t.Errorf("sessionID = %q, want empty", sessionID)
+	}
+}
