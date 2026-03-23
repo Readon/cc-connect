@@ -40,7 +40,7 @@ func New(opts map[string]any) (core.Agent, error) {
 	}
 
 	if _, err := exec.LookPath(cmd); err != nil {
-		return nil, fmt.Errorf("hermes: %q not found in PATH, see https://github.com/anthropics/hermes for installation", cmd)
+		return nil, fmt.Errorf("hermes: %q not found in PATH, see https://github.com/NousResearch/hermes-agent for installation", cmd)
 	}
 
 	return &Agent{

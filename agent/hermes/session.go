@@ -1,10 +1,8 @@
 package hermes
 
 import (
-	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -20,7 +18,7 @@ import (
 )
 
 // hermesSession manages a multi-turn Hermes conversation.
-// Each Send() spawns `hermes --output-format stream-json -p <prompt>`.
+// Each Send() spawns `hermes chat -q <prompt> -Q`.
 // Subsequent turns use `--resume <sessionID>` to continue the conversation.
 type hermesSession struct {
 	cmd       string
@@ -70,7 +68,10 @@ func (s *hermesSession) Send(prompt string, images []core.ImageAttachment, files
 		return fmt.Errorf("session is closed")
 	}
 
-	args := []string{"--output-format", "stream-json", "-p", prompt}
+	// Hermes uses `hermes chat -q <prompt> -Q` for non-interactive single-query
+	// mode. -Q (--quiet) suppresses the banner and spinner, and outputs only the
+	// final response text followed by a `session_id: <id>` line.
+	args := []string{"chat", "-q", prompt, "-Q"}
 
 	sid := s.CurrentSessionID()
 	if sid != "" {
@@ -83,7 +84,7 @@ func (s *hermesSession) Send(prompt string, images []core.ImageAttachment, files
 
 	if s.mode == "yolo" {
 		slog.Warn("hermesSession: launching in yolo mode — all permission checks bypassed")
-		args = append(args, "--dangerously-skip-permissions")
+		args = append(args, "--yolo")
 	}
 
 	slog.Debug("hermesSession: launching", "resume", sid != "", "args", core.RedactArgs(args))
@@ -116,42 +117,43 @@ func (s *hermesSession) Send(prompt string, images []core.ImageAttachment, files
 
 func (s *hermesSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf *bytes.Buffer) {
 	defer s.wg.Done()
-	defer func() {
-		if err := cmd.Wait(); err != nil {
-			stderrMsg := strings.TrimSpace(stderrBuf.String())
-			if stderrMsg != "" {
-				slog.Error("hermesSession: process failed", "error", err, "stderr", truncStr(stderrMsg, 200))
-				evt := core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrMsg)}
-				select {
-				case s.events <- evt:
-				case <-s.ctx.Done():
-					return
-				}
+
+	// Buffer all output — hermes quiet mode emits the complete response at once.
+	outputBytes, readErr := io.ReadAll(stdout)
+
+	if err := cmd.Wait(); err != nil {
+		stderrMsg := strings.TrimSpace(stderrBuf.String())
+		if stderrMsg != "" {
+			slog.Error("hermesSession: process failed", "error", err, "stderr", truncStr(stderrMsg, 200))
+			evt := core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrMsg)}
+			select {
+			case s.events <- evt:
+			case <-s.ctx.Done():
+				return
 			}
 		}
-	}()
-
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			continue
-		}
-
-		var raw map[string]any
-		if err := json.Unmarshal([]byte(line), &raw); err != nil {
-			slog.Debug("hermesSession: non-JSON line", "line", truncStr(line, 100))
-			continue
-		}
-
-		s.handleEvent(raw)
+		return
 	}
 
-	if err := scanner.Err(); err != nil {
-		slog.Error("hermesSession: scanner error", "error", err)
-		evt := core.Event{Type: core.EventError, Error: fmt.Errorf("read stdout: %w", err)}
+	if readErr != nil {
+		slog.Error("hermesSession: read stdout", "error", readErr)
+		evt := core.Event{Type: core.EventError, Error: fmt.Errorf("read stdout: %w", readErr)}
+		select {
+		case s.events <- evt:
+		case <-s.ctx.Done():
+		}
+		return
+	}
+
+	response, sessionID := parseHermesOutput(string(outputBytes))
+
+	if sessionID != "" {
+		s.sessionID.Store(sessionID)
+		slog.Debug("hermesSession: session started", "session_id", sessionID)
+	}
+
+	if response != "" {
+		evt := core.Event{Type: core.EventText, Content: response}
 		select {
 		case s.events <- evt:
 		case <-s.ctx.Done():
@@ -159,7 +161,6 @@ func (s *hermesSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf 
 		}
 	}
 
-	// Emit EventResult when the process finishes.
 	sid := s.CurrentSessionID()
 	evt := core.Event{Type: core.EventResult, SessionID: sid, Done: true}
 	select {
@@ -168,113 +169,31 @@ func (s *hermesSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf 
 	}
 }
 
-// handleEvent dispatches a parsed JSON event from the Hermes CLI.
-// Hermes emits events in a format compatible with the Claude Code streaming
-// protocol (stream-json), so we handle the same event types.
-func (s *hermesSession) handleEvent(raw map[string]any) {
-	eventType, _ := raw["type"].(string)
+// parseHermesOutput splits the quiet-mode output into the response text and the
+// session ID.  Hermes prints the response followed by a blank line and then
+// "session_id: <id>" (with a leading newline before the label).
+func parseHermesOutput(output string) (response, sessionID string) {
+	lines := strings.Split(output, "\n")
 
-	switch eventType {
-	case "system":
-		// Session init event with session ID.
-		if subtype, _ := raw["subtype"].(string); subtype == "init" {
-			if id, ok := raw["session_id"].(string); ok && id != "" {
-				s.sessionID.Store(id)
-				slog.Debug("hermesSession: session started", "session_id", id)
-			}
-		}
-
-	case "assistant":
-		s.handleAssistantEvent(raw)
-
-	case "result":
-		content, _ := raw["result"].(string)
-		sid := s.CurrentSessionID()
-		evt := core.Event{Type: core.EventResult, Content: content, SessionID: sid, Done: true}
-		select {
-		case s.events <- evt:
-		case <-s.ctx.Done():
-		}
-
-	default:
-		slog.Debug("hermesSession: unhandled event", "type", eventType)
-	}
-}
-
-// handleAssistantEvent processes assistant message events.
-func (s *hermesSession) handleAssistantEvent(raw map[string]any) {
-	message, _ := raw["message"].(map[string]any)
-	if message == nil {
-		return
-	}
-
-	content, _ := message["content"].([]any)
-	for _, c := range content {
-		item, _ := c.(map[string]any)
-		if item == nil {
-			continue
-		}
-
-		itemType, _ := item["type"].(string)
-		switch itemType {
-		case "text":
-			text, _ := item["text"].(string)
-			if text != "" {
-				evt := core.Event{Type: core.EventText, Content: text}
-				select {
-				case s.events <- evt:
-				case <-s.ctx.Done():
-					return
-				}
-			}
-
-		case "thinking":
-			thinking, _ := item["thinking"].(string)
-			if thinking != "" {
-				evt := core.Event{Type: core.EventThinking, Content: thinking}
-				select {
-				case s.events <- evt:
-				case <-s.ctx.Done():
-					return
-				}
-			}
-
-		case "tool_use":
-			name, _ := item["name"].(string)
-			input := extractToolInput(item)
-			evt := core.Event{Type: core.EventToolUse, ToolName: name, ToolInput: input}
-			select {
-			case s.events <- evt:
-			case <-s.ctx.Done():
-				return
-			}
+	// Scan from the end for the "session_id: " line.
+	sidIdx := -1
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(line, "session_id: ") {
+			sessionID = strings.TrimPrefix(line, "session_id: ")
+			sidIdx = i
+			break
 		}
 	}
-}
 
-// extractToolInput pulls a concise summary from a tool_use content item.
-func extractToolInput(item map[string]any) string {
-	inputRaw, _ := item["input"].(map[string]any)
-	if inputRaw == nil {
-		return ""
+	// Everything before the session_id line (minus trailing blank lines) is the response.
+	if sidIdx >= 0 {
+		response = strings.TrimRight(strings.Join(lines[:sidIdx], "\n"), "\n")
+	} else {
+		response = strings.TrimRight(output, "\n")
 	}
-	if cmd, ok := inputRaw["command"].(string); ok && cmd != "" {
-		return cmd
-	}
-	if fp, ok := inputRaw["file_path"].(string); ok && fp != "" {
-		return fp
-	}
-	if pattern, ok := inputRaw["pattern"].(string); ok && pattern != "" {
-		return pattern
-	}
-	if query, ok := inputRaw["query"].(string); ok && query != "" {
-		return query
-	}
-	if desc, ok := inputRaw["description"].(string); ok && desc != "" {
-		return desc
-	}
-	b, _ := json.Marshal(inputRaw)
-	return truncStr(string(b), 200)
+
+	return
 }
 
 func (s *hermesSession) RespondPermission(_ string, _ core.PermissionResult) error {
